@@ -1,0 +1,10 @@
+streamlit
+supabase
+langchain-core
+langchain-groq
+langchain-community
+langchain-huggingface
+faiss-cpu
+sentence-transformers
+deep-translator
+numpy
