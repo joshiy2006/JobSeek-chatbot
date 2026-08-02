@@ -202,68 +202,7 @@ Rating: {job.get('stars', 'N/A')}""".strip()
     except Exception as e:
         return f"Error: {str(e)}"
 
-def load_embeddings_from_supabase(embedding_model):
-    try:
-        from langchain_community.vectorstores import FAISS
 
-        count_res = supabase.table("job_embeddings").select("id", count="exact").execute()
-        total = count_res.count or 0
-        if total == 0:
-            return None, 0
-
-        chunk_size = 500
-        offset = 0
-        vector_store = None
-        progress = st.progress(0, text="Loading embeddings from Supabase...")
-
-        while offset < total:
-            res = supabase.table("job_embeddings").select("*")\
-                .range(offset, offset + chunk_size - 1).execute()
-            chunk = res.data or []
-            if not chunk:
-                break
-
-            chunk_text_embeddings = []
-            chunk_metadatas = []
-
-            for row in chunk:
-                embedding = row["embedding"]
-                if isinstance(embedding, str):
-                    embedding = json.loads(embedding)
-                embedding = [float(x) for x in embedding]
-                chunk_text_embeddings.append((row["page_content"], embedding))
-                chunk_metadatas.append({
-                    "jobtitle": row.get("jobtitle", ""),
-                    "company": row.get("company", ""),
-                    "location": row.get("location", ""),
-                    "skills": row.get("skills", ""),
-                })
-
-            if vector_store is None:
-                vector_store = FAISS.from_embeddings(
-                    text_embeddings=chunk_text_embeddings,
-                    embedding=embedding_model,
-                    metadatas=chunk_metadatas
-                )
-            else:
-                chunk_store = FAISS.from_embeddings(
-                    text_embeddings=chunk_text_embeddings,
-                    embedding=embedding_model,
-                    metadatas=chunk_metadatas
-                )
-                vector_store.merge_from(chunk_store)
-
-            offset += chunk_size
-            progress.progress(
-                min(offset / total, 1.0),
-                text=f"Loading... {min(offset, total)}/{total}"
-            )
-
-        progress.empty()
-        return vector_store, total
-
-    except Exception as e:
-        return None, str(e)
 
 @st.cache_resource
 def get_vector_store():
@@ -276,11 +215,11 @@ def get_vector_store():
         saved_res = supabase.table("job_embeddings").select("id", count="exact").execute()
         total_saved = saved_res.count or 0
 
+        # If embeddings are already saved in Supabase, we are ready!
         if total_saved >= total_jobs and total_saved > 0:
-            vector_store, result = load_embeddings_from_supabase(embedding_model)
-            if vector_store:
-                return vector_store, result, "loaded"
+            return True, total_saved, "loaded"
 
+        # Otherwise, embed new jobs and save them to Supabase
         all_jobs = []
         page_size = 1000
         offset = 0
@@ -303,19 +242,39 @@ def get_vector_store():
         if isinstance(saved, str):
             return None, saved, "save_error"
 
-        vector_store, result = load_embeddings_from_supabase(embedding_model)
-        if vector_store:
-            return vector_store, result, "created"
-        else:
-            return None, result, "load_error"
+        return True, saved, "created"
 
     except Exception as e:
         return None, str(e), "exception"
 
-def rag_search(query, vector_store, k=5):
+def rag_search(query, vector_store=None, k=5):
+    """
+    Queries the native pgvector HNSW index in Supabase using the match_jobs RPC function.
+    (vector_store arg is kept optional so existing UI calls don't break!)
+    """
     try:
-        return vector_store.similarity_search(query, k=k)
-    except Exception:
+        embedding_model = load_embedding_model()
+        query_vector = embedding_model.embed_query(query)
+        
+        res = supabase.rpc("match_jobs", {
+            "query_embedding": query_vector,
+            "match_count": k
+        }).execute()
+        
+        return [
+            Document(
+                page_content=row["page_content"],
+                metadata={
+                    "jobtitle": row.get("jobtitle", ""),
+                    "company": row.get("company", ""),
+                    "location": row.get("location", ""),
+                    "skills": row.get("skills", "")
+                }
+            )
+            for row in (res.data or [])
+        ]
+    except Exception as e:
+        st.error(f"Search error: {str(e)}")
         return []
 
 # ------------------------------------------------
