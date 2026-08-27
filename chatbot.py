@@ -34,7 +34,7 @@ if not GROQ_API_KEY or not SUPABASE_KEY or not SUPABASE_URL:
 # Supabase + LLM clients (must be created BEFORE auth check)
 # ------------------------------------------------
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="llama-3.3-70b-versatile")
+llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="openai/gpt-oss-120b")
 
 # ------------------------------------------------
 # Auth: get token from URL params and verify user
