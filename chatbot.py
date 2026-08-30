@@ -3,7 +3,6 @@ import os
 import re
 import json
 import inspect
-import numpy as np
 from datetime import datetime, timedelta
 from supabase import create_client
 from langchain_groq import ChatGroq
@@ -54,14 +53,12 @@ except Exception:
     st.error("❌ Invalid or expired session. Please log in again.")
     st.stop()
 
-# Store user_id in session state for use across reruns
 st.session_state["user_id"] = current_user_id
 
 # ------------------------------------------------
 # Chat History Persistence
 # ------------------------------------------------
 def load_chat_history(user_id: str, limit: int = 50):
-    """Load the most recent chat messages for this user from Supabase."""
     try:
         res = supabase.table("chat_history") \
             .select("role, message, created_at") \
@@ -74,7 +71,6 @@ def load_chat_history(user_id: str, limit: int = 50):
         return []
 
 def save_chat_message(user_id: str, role: str, message: str):
-    """Save a single chat message to Supabase."""
     try:
         supabase.table("chat_history").insert({
             "user_id": user_id,
@@ -87,13 +83,45 @@ def save_chat_message(user_id: str, role: str, message: str):
 # ------------------------------------------------
 # TABLE SCHEMA
 # ------------------------------------------------
+# Single source table now — new_jobs_data replaces both the old
+# naukri_jobs and jobs tables. Note: no industry/sector column exists
+# here (unlike the old `jobs` table), and jobUploaded is relative text
+# ("3 Days Ago") rather than a real date — days_ago (a generated
+# integer column added via migration) is what filtering/sorting
+# actually uses.
 TABLE_SCHEMA = """
-PRIMARY TABLE: naukri_jobs
-Columns: id, jobtitle, company, stars, experience, location, skills, posted, postdate, site_name, uniq_id, created_at
-
-SECONDARY TABLE: jobs
-Columns: jobid, jobtitle, company, joblocation_address, skills, payrate, postdate, industry, experience, education, jobdescription, numberofpositions, site_name, uniq_id
+TABLE: new_jobs_data
+Columns: jobId, title, companyName, companyId, location, experience,
+         minimumExperience, maximumExperience, salary, minimumSalary,
+         maximumSalary, currency, tagsAndSkills, jobDescription,
+         jobUploaded (relative text, NOT sortable — use days_ago),
+         days_ago (generated integer, 0 = most recent posting),
+         ReviewsCount, AggregateRating
 """
+
+# ------------------------------------------------
+# SALARY FORMATTING
+# ------------------------------------------------
+# minimumSalary/maximumSalary are stored as TEXT, as raw rupee amounts
+# (not LPA), and "0" means "not disclosed" — but "0" is a non-empty
+# string (truthy), so a naive check would misreport it as a real
+# ₹0–0 LPA range. Mirrors the same fix applied on the frontend.
+def to_lakhs(rupees: float) -> str:
+    lakhs = rupees / 100000
+    if lakhs == int(lakhs):
+        return str(int(lakhs))
+    return f"{lakhs:.2f}".rstrip('0').rstrip('.')
+
+def format_salary(min_raw, max_raw, currency=None) -> str:
+    try:
+        min_val = float(min_raw)
+        max_val = float(max_raw)
+    except (TypeError, ValueError):
+        return "Not disclosed"
+    if min_val <= 0 or max_val <= 0:
+        return "Not disclosed"
+    cur = currency or "₹"
+    return f"{cur}{to_lakhs(min_val)}–{to_lakhs(max_val)} LPA"
 
 # ------------------------------------------------
 # TRANSLATION
@@ -124,151 +152,58 @@ def load_embedding_model():
 
 def embeddings_exist():
     try:
-        res = supabase.table("job_embeddings").select("id").limit(1).execute()
+        res = supabase.table("job_embeddings").select("jobId").limit(1).execute()
         return len(res.data) > 0
     except Exception:
         return False
 
-def save_embeddings_to_supabase(jobs, embedding_model):
-    try:
-        existing_ids = set()
-        offset = 0
-        while True:
-            res = supabase.table("job_embeddings")\
-                .select("id").range(offset, offset + 999).execute()
-            batch = res.data or []
-            if not batch:
-                break
-            existing_ids.update(row["id"] for row in batch)
-            offset += 1000
-            if len(batch) < 1000:
-                break
-
-        new_jobs = [job for job in jobs if job.get("id") not in existing_ids]
-        if not new_jobs:
-            return 0
-
-        saved = 0
-        all_records = []
-        batch_size = 200
-        progress = st.progress(0, text=f"Embedding {len(new_jobs)} new jobs...")
-
-        for batch_start in range(0, len(new_jobs), batch_size):
-            batch_jobs = new_jobs[batch_start: batch_start + batch_size]
-            page_contents = []
-            for job in batch_jobs:
-                content = f"""Job Title: {job.get('jobtitle', 'N/A')}
-Company: {job.get('company', 'N/A')}
-Location: {job.get('location', 'N/A')}
-Experience: {job.get('experience', 'N/A')}
-Skills: {job.get('skills', 'N/A')}
-Rating: {job.get('stars', 'N/A')}""".strip()
-                page_contents.append(content)
-
-            embeddings = embedding_model.embed_documents(page_contents)
-
-            for job, content, embedding in zip(batch_jobs, page_contents, embeddings):
-                all_records.append({
-                    "id": job.get("id"),
-                    "jobtitle": job.get("jobtitle", ""),
-                    "company": job.get("company", ""),
-                    "location": job.get("location", ""),
-                    "skills": job.get("skills", ""),
-                    "experience": job.get("experience", ""),
-                    "stars": job.get("stars", ""),
-                    "page_content": content,
-                    "embedding": embedding
-                })
-
-            progress.progress(
-                min((batch_start + batch_size) / len(new_jobs), 1.0),
-                text=f"Embedding... {min(batch_start + batch_size, len(new_jobs))}/{len(new_jobs)}"
-            )
-
-        progress2 = st.progress(0, text=f"Saving {len(all_records)} records to Supabase...")
-        for i in range(0, len(all_records), 50):
-            chunk = all_records[i:i + 50]
-            supabase.table("job_embeddings").upsert(chunk, on_conflict="id").execute()
-            saved += len(chunk)
-            progress2.progress(
-                min((i + 50) / len(all_records), 1.0),
-                text=f"Saving... {min(i + 50, len(all_records))}/{len(all_records)}"
-            )
-
-        progress.empty()
-        progress2.empty()
-        return saved
-
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-
-
 @st.cache_resource
 def get_vector_store():
+    """
+    Only CHECKS whether embeddings are ready — does not build them.
+    Given the size of new_jobs_data (97k+ rows), embedding runs via the
+    separate build_job_embeddings.py script (offline, or on a schedule),
+    not inline in the app's request path where it could time out.
+    """
     try:
-        embedding_model = load_embedding_model()
-
-        total_res = supabase.table("naukri_jobs").select("id", count="exact").execute()
+        total_res = supabase.table("new_jobs_data").select("jobId", count="exact").execute()
         total_jobs = total_res.count or 0
 
-        saved_res = supabase.table("job_embeddings").select("id", count="exact").execute()
+        saved_res = supabase.table("job_embeddings").select("jobId", count="exact").execute()
         total_saved = saved_res.count or 0
 
-        # If embeddings are already saved in Supabase, we are ready!
         if total_saved >= total_jobs and total_saved > 0:
-            return True, total_saved, "loaded"
-
-        # Otherwise, embed new jobs and save them to Supabase
-        all_jobs = []
-        page_size = 1000
-        offset = 0
-        while True:
-            res = supabase.table("naukri_jobs").select(
-                "id, jobtitle, company, location, skills, experience, stars"
-            ).range(offset, offset + page_size - 1).execute()
-            batch = res.data or []
-            if not batch:
-                break
-            all_jobs.extend(batch)
-            offset += page_size
-            if len(batch) < page_size:
-                break
-
-        if not all_jobs:
-            return None, 0, "no_data"
-
-        saved = save_embeddings_to_supabase(all_jobs, embedding_model)
-        if isinstance(saved, str):
-            return None, saved, "save_error"
-
-        return True, saved, "created"
+            return True, total_saved, "ready"
+        elif total_saved > 0:
+            # RAG works, just hasn't finished indexing everything yet
+            return True, total_saved, "partial"
+        else:
+            return None, 0, "not_built"
 
     except Exception as e:
         return None, str(e), "exception"
 
 def rag_search(query, vector_store=None, k=5):
-    """
-    Queries the native pgvector HNSW index in Supabase using the match_jobs RPC function.
-    (vector_store arg is kept optional so existing UI calls don't break!)
-    """
     try:
         embedding_model = load_embedding_model()
         query_vector = embedding_model.embed_query(query)
-        
+
         res = supabase.rpc("match_jobs", {
             "query_embedding": query_vector,
             "match_count": k
         }).execute()
-        
+
         return [
             Document(
                 page_content=row["page_content"],
                 metadata={
-                    "jobtitle": row.get("jobtitle", ""),
-                    "company": row.get("company", ""),
+                    "title": row.get("title", ""),
+                    "companyName": row.get("companyName", ""),
                     "location": row.get("location", ""),
-                    "skills": row.get("skills", "")
+                    "tagsAndSkills": row.get("tagsAndSkills", ""),
+                    "experience": row.get("experience", ""),
+                    "salary_display": row.get("salary_display", ""),
+                    "rating": row.get("rating", "")
                 }
             )
             for row in (res.data or [])
@@ -310,7 +245,7 @@ Examples:
 "What about Mumbai?" → "Python Developer jobs in Mumbai"
 "Show me similar ones" → "Machine Learning Engineer jobs Bangalore"
 "What skills do I need?" → "Required skills for Data Analyst role"
-"How much do they pay?" → "Data Scientist salary payrate"
+"How much do they pay?" → "Data Scientist salary"
 """
     try:
         response = llm.invoke(rewrite_prompt)
@@ -353,17 +288,17 @@ Instructions:
 - Format EACH job as a compact 3-line card exactly like this:
 
 **1. Job Title** — Company Name
-📍 Location | ⏳ Experience | ⭐ Rating
+📍 Location | ⏳ Experience | 💰 Salary
 🛠️ `skill1` `skill2` `skill3` `skill4`
 
 **2. Job Title** — Company Name
-📍 Location | ⏳ Experience | ⭐ Rating
+📍 Location | ⏳ Experience | 💰 Salary
 🛠️ `skill1` `skill2` `skill3`
 
 Rules for cards:
 - Strictly 3 lines per card, no more
 - Keep location short — city names only, max 2-3 cities
-- If rating is missing or None → write N/A
+- If salary is missing or "Not disclosed" → write "Not disclosed", don't invent a number
 - Skills in backticks like tags — max 4-5 skills per card
 - Separate each card with a blank line
 - After ALL cards write ONE short summary line (max 20 words)
@@ -384,35 +319,45 @@ Rules for cards:
 def fetch_market_data_for_risk(role):
     data = {}
     try:
-        res = supabase.table("naukri_jobs").select("*", count="exact")\
-            .ilike("jobtitle", f"%{role}%").execute()
-        data["total_jobs"] = res.count or 0
+        base_q = supabase.table("new_jobs_data").select("*", count="exact")
+        if role:
+            base_q = base_q.ilike("title", f"%{role}%")
+        data["total_jobs"] = base_q.execute().count or 0
 
-        res2 = supabase.table("naukri_jobs").select("skills")\
-            .ilike("jobtitle", f"%{role}%").limit(100).execute()
+        skills_q = supabase.table("new_jobs_data").select("tagsAndSkills")
+        if role:
+            skills_q = skills_q.ilike("title", f"%{role}%")
+        skills_res = skills_q.limit(100).execute()
         freq = {}
-        for row in res2.data or []:
-            for s in (row.get("skills") or "").split(","):
+        for row in skills_res.data or []:
+            for s in (row.get("tagsAndSkills") or "").split(","):
                 s = s.strip().lower()
                 if s:
                     freq[s] = freq.get(s, 0) + 1
         data["top_skills"] = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:15]
 
-        cutoff_recent = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        cutoff_old = (datetime.utcnow() - timedelta(days=180)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        # No absolute postdate exists here — jobUploaded is relative
+        # text, parsed into the days_ago integer column. Recent vs
+        # previous period uses that instead of a calendar cutoff.
+        # If jobUploaded turns out to have an unconfirmed cap for
+        # older postings (similar to what showed up in another table),
+        # the prev-period count could be inflated right at that
+        # boundary — worth spot-checking once real numbers come in.
+        recent_q = supabase.table("new_jobs_data").select("*", count="exact").lte("days_ago", 90)
+        if role:
+            recent_q = recent_q.ilike("title", f"%{role}%")
+        data["recent_3m"] = recent_q.execute().count or 0
 
-        res_recent = supabase.table("naukri_jobs").select("*", count="exact")\
-            .ilike("jobtitle", f"%{role}%").gte("postdate", cutoff_recent).execute()
-        data["recent_3m"] = res_recent.count or 0
+        prev_q = supabase.table("new_jobs_data").select("*", count="exact").gt("days_ago", 90).lte("days_ago", 180)
+        if role:
+            prev_q = prev_q.ilike("title", f"%{role}%")
+        data["prev_3m"] = prev_q.execute().count or 0
 
-        res_old = supabase.table("naukri_jobs").select("*", count="exact")\
-            .ilike("jobtitle", f"%{role}%")\
-            .gte("postdate", cutoff_old).lt("postdate", cutoff_recent).execute()
-        data["prev_3m"] = res_old.count or 0
-
-        res4 = supabase.table("naukri_jobs").select("company")\
-            .ilike("jobtitle", f"%{role}%").limit(100).execute()
-        companies = list(set([r.get("company", "") for r in res4.data or [] if r.get("company")]))
+        companies_q = supabase.table("new_jobs_data").select("companyName")
+        if role:
+            companies_q = companies_q.ilike("title", f"%{role}%")
+        companies_res = companies_q.limit(100).execute()
+        companies = list({r.get("companyName", "") for r in companies_res.data or [] if r.get("companyName")})
         data["unique_companies"] = len(companies)
         data["top_companies"] = companies[:10]
 
@@ -575,120 +520,103 @@ def handle_risk_conversation(user_message, is_hindi):
 # ================================================
 # TOOL CALLING SECTION
 # ================================================
+# Consolidated to a single set of tools against new_jobs_data — the
+# old naukri_jobs/jobs split no longer applies. industry_breakdown is
+# gone entirely: there's no industry/sector column in this schema, so
+# rather than leave a tool that silently returns nothing meaningful,
+# it's removed. Add it back if you wire in a real industry data source.
 
 TOOLS = {
-    "count_jobs_naukri": {"description": "Count jobs from naukri_jobs matching role/city", "params": ["role", "city", "months"]},
-    "list_jobs_naukri": {"description": "List jobs from naukri_jobs for a role/city", "params": ["role", "city", "months", "limit"]},
-    "count_jobs_secondary": {"description": "Count jobs from jobs table", "params": ["role", "city", "months"]},
-    "list_jobs_secondary": {"description": "List jobs from jobs table with salary info", "params": ["role", "city", "limit"]},
+    "count_jobs": {"description": "Count jobs matching role/city/recency", "params": ["role", "city", "months"]},
+    "list_jobs": {"description": "List jobs for a role/city, with salary info", "params": ["role", "city", "months", "limit"]},
     "top_skills": {"description": "Get most in-demand skills for a role", "params": ["role"]},
-    "industry_breakdown": {"description": "Show industries hiring for a role", "params": ["role", "city"]},
-    "salary_insights": {"description": "Show salary info from jobs table", "params": ["role", "city"]},
-    "recent_jobs": {"description": "Get jobs posted in last N months", "params": ["months", "role"]},
+    "salary_insights": {"description": "Show salary info for a role/city", "params": ["role", "city"]},
+    "recent_jobs": {"description": "Get jobs posted in the last N months", "params": ["months", "role"]},
     "company_jobs": {"description": "List jobs from a specific company", "params": ["company", "role"]},
     "run_custom_sql": {"description": "Run custom PostgreSQL SELECT query", "params": ["sql"]},
     "general_advice": {"description": "Answer career questions using LLM knowledge", "params": ["question"]}
 }
 
-def count_jobs_naukri(role="", city="", months=None):
+def count_jobs(role="", city="", months=None):
     try:
-        q = supabase.table("naukri_jobs").select("*", count="exact")
-        if role: q = q.ilike("jobtitle", f"%{role}%")
+        q = supabase.table("new_jobs_data").select("*", count="exact")
+        if role: q = q.ilike("title", f"%{role}%")
         if city: q = q.ilike("location", f"%{city}%")
-        if months:
-            cutoff = datetime.utcnow() - timedelta(days=30 * int(months))
-            q = q.gte("postdate", cutoff.strftime("%Y-%m-%dT%H:%M:%S+00:00"))
+        if months: q = q.lte("days_ago", 30 * int(months))
         return {"count": q.execute().count or 0}
     except Exception as e:
         return {"error": str(e)}
 
-def list_jobs_naukri(role="", city="", months=None, limit=8):
+def list_jobs(role="", city="", months=None, limit=8):
     try:
-        q = supabase.table("naukri_jobs").select("jobtitle, company, location, skills, experience, stars, posted, postdate")
-        if role: q = q.ilike("jobtitle", f"%{role}%")
+        q = supabase.table("new_jobs_data").select(
+            "title, companyName, location, tagsAndSkills, experience, jobUploaded, "
+            "minimumSalary, maximumSalary, currency"
+        )
+        if role: q = q.ilike("title", f"%{role}%")
         if city: q = q.ilike("location", f"%{city}%")
-        if months:
-            cutoff = datetime.utcnow() - timedelta(days=30 * int(months))
-            q = q.gte("postdate", cutoff.strftime("%Y-%m-%dT%H:%M:%S+00:00"))
-        return {"jobs": q.limit(int(limit)).execute().data or []}
-    except Exception as e:
-        return {"error": str(e)}
-
-def count_jobs_secondary(role="", city="", months=None):
-    try:
-        q = supabase.table("jobs").select("*", count="exact")
-        if role: q = q.ilike("jobtitle", f"%{role}%")
-        if city: q = q.ilike("joblocation_address", f"%{city}%")
-        if months:
-            cutoff = datetime.utcnow() - timedelta(days=30 * int(months))
-            q = q.gte("postdate", cutoff.strftime("%Y-%m-%d"))
-        return {"count": q.execute().count or 0}
-    except Exception as e:
-        return {"error": str(e)}
-
-def list_jobs_secondary(role="", city="", limit=8):
-    try:
-        q = supabase.table("jobs").select("jobtitle, company, joblocation_address, skills, payrate, experience, industry")
-        if role: q = q.ilike("jobtitle", f"%{role}%")
-        if city: q = q.ilike("joblocation_address", f"%{city}%")
-        return {"jobs": q.limit(int(limit)).execute().data or []}
+        if months: q = q.lte("days_ago", 30 * int(months))
+        rows = q.order("days_ago", desc=False).limit(int(limit)).execute().data or []
+        for r in rows:
+            r["salary_display"] = format_salary(r.get("minimumSalary"), r.get("maximumSalary"), r.get("currency"))
+        return {"jobs": rows}
     except Exception as e:
         return {"error": str(e)}
 
 def top_skills(role=""):
     try:
-        q = supabase.table("naukri_jobs").select("skills")
-        if role: q = q.ilike("jobtitle", f"%{role}%")
+        q = supabase.table("new_jobs_data").select("tagsAndSkills")
+        if role: q = q.ilike("title", f"%{role}%")
         res = q.limit(150).execute()
         freq = {}
         for row in res.data or []:
-            for s in (row.get("skills") or "").split(","):
+            for s in (row.get("tagsAndSkills") or "").split(","):
                 s = s.strip()
                 if s: freq[s] = freq.get(s, 0) + 1
         return {"skills": sorted(freq.items(), key=lambda x: x[1], reverse=True)[:12]}
     except Exception as e:
         return {"error": str(e)}
 
-def industry_breakdown(role="", city=""):
-    try:
-        q = supabase.table("jobs").select("industry")
-        if role: q = q.ilike("jobtitle", f"%{role}%")
-        if city: q = q.ilike("joblocation_address", f"%{city}%")
-        res = q.limit(200).execute()
-        freq = {}
-        for row in res.data or []:
-            ind = row.get("industry") or "Unknown"
-            freq[ind] = freq.get(ind, 0) + 1
-        return {"industries": dict(sorted(freq.items(), key=lambda x: x[1], reverse=True)[:8])}
-    except Exception as e:
-        return {"error": str(e)}
-
 def salary_insights(role="", city=""):
     try:
-        q = supabase.table("jobs").select("jobtitle, company, payrate, joblocation_address")
-        if role: q = q.ilike("jobtitle", f"%{role}%")
-        if city: q = q.ilike("joblocation_address", f"%{city}%")
-        res = q.limit(20).execute()
-        return {"salary_data": [r for r in (res.data or []) if r.get("payrate")]}
+        q = supabase.table("new_jobs_data").select(
+            "title, companyName, location, minimumSalary, maximumSalary, currency"
+        )
+        if role: q = q.ilike("title", f"%{role}%")
+        if city: q = q.ilike("location", f"%{city}%")
+        res = q.limit(30).execute()
+        rows = []
+        for r in res.data or []:
+            display = format_salary(r.get("minimumSalary"), r.get("maximumSalary"), r.get("currency"))
+            if display != "Not disclosed":  # don't clutter results with undisclosed rows
+                r["salary_display"] = display
+                rows.append(r)
+        return {"salary_data": rows}
     except Exception as e:
         return {"error": str(e)}
 
 def recent_jobs(months=3, role=""):
     try:
-        cutoff = datetime.utcnow() - timedelta(days=30 * int(months))
-        q = supabase.table("naukri_jobs").select("jobtitle, company, location, postdate, skills, posted")\
-            .gte("postdate", cutoff.strftime("%Y-%m-%dT%H:%M:%S+00:00"))
-        if role: q = q.ilike("jobtitle", f"%{role}%")
+        q = supabase.table("new_jobs_data").select(
+            "title, companyName, location, jobUploaded, tagsAndSkills"
+        ).lte("days_ago", 30 * int(months)).order("days_ago", desc=False)
+        if role: q = q.ilike("title", f"%{role}%")
         return {"jobs": q.limit(15).execute().data or [], "months": months}
     except Exception as e:
         return {"error": str(e)}
 
 def company_jobs(company="", role=""):
     try:
-        q = supabase.table("naukri_jobs").select("jobtitle, company, location, skills, experience, stars, posted")
-        if company: q = q.ilike("company", f"%{company}%")
-        if role: q = q.ilike("jobtitle", f"%{role}%")
-        return {"jobs": q.limit(10).execute().data or []}
+        q = supabase.table("new_jobs_data").select(
+            "title, companyName, location, tagsAndSkills, experience, jobUploaded, "
+            "minimumSalary, maximumSalary, currency"
+        )
+        if company: q = q.ilike("companyName", f"%{company}%")
+        if role: q = q.ilike("title", f"%{role}%")
+        rows = q.order("days_ago", desc=False).limit(10).execute().data or []
+        for r in rows:
+            r["salary_display"] = format_salary(r.get("minimumSalary"), r.get("maximumSalary"), r.get("currency"))
+        return {"jobs": rows}
     except Exception as e:
         return {"error": str(e)}
 
@@ -708,12 +636,9 @@ def general_advice(question=""):
         return {"error": str(e)}
 
 TOOL_FUNCTIONS = {
-    "count_jobs_naukri": count_jobs_naukri,
-    "list_jobs_naukri": list_jobs_naukri,
-    "count_jobs_secondary": count_jobs_secondary,
-    "list_jobs_secondary": list_jobs_secondary,
+    "count_jobs": count_jobs,
+    "list_jobs": list_jobs,
     "top_skills": top_skills,
-    "industry_breakdown": industry_breakdown,
     "salary_insights": salary_insights,
     "recent_jobs": recent_jobs,
     "company_jobs": company_jobs,
@@ -761,11 +686,10 @@ CONVERSATION HISTORY:
 USER QUESTION: {user_question}
 
 Rules:
-1. Default to naukri_jobs tools for most queries
-2. Use jobs table for salary/industry/payrate
-3. Use run_custom_sql for complex queries
-4. Use general_advice for career knowledge
-5. Pass limit as integer always
+1. Use the structured tools (count_jobs, list_jobs, etc.) for anything they cover
+2. Use run_custom_sql only for something the structured tools can't express
+3. Use general_advice for career knowledge unrelated to this specific dataset
+4. Pass limit/months as integers always
 
 Respond ONLY with JSON array:
 [{{"tool": "name", "params": {{}}, "reason": "why"}}]
@@ -836,55 +760,43 @@ Instructions:
 # ================================================
 # BUILD RAG INDEX ON STARTUP
 # ================================================
-with st.spinner("⏳ Loading RAG index..."):
+with st.spinner("⏳ Checking RAG index..."):
     vector_store, result, status = get_vector_store()
 
-if vector_store:
-    if status == "created":
-        st.success(f"✅ RAG created and saved! {result} jobs indexed permanently.")
-    elif status == "loaded":
-        st.success(f"✅ RAG loaded instantly! {result} jobs ready.")
+if status == "ready":
+    st.success(f"✅ RAG ready — {result} jobs indexed.")
+elif status == "partial":
+    st.warning(f"⚠️ RAG partially ready — {result} jobs indexed so far. "
+               f"Run `python build_job_embeddings.py` again to finish indexing the rest.")
+elif status == "not_built":
+    st.error("❌ No embeddings found yet. Run `python build_job_embeddings.py` "
+             "separately, then reload this app.")
 else:
-    if status == "no_data":
-        st.error("❌ No data in naukri_jobs table.")
-    elif status == "save_error":
-        st.error(f"❌ Save failed: {result}")
-    elif status == "load_error":
-        st.error(f"❌ Load failed: {result}")
-    else:
-        st.error(f"❌ RAG failed: {result}")
+    st.error(f"❌ Could not check RAG status: {result}")
 
 # ================================================
 # DEBUG PANEL
 # ================================================
 with st.expander("🔧 Debug Panel"):
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3 = st.columns(3)
     with col1:
-        if st.button("Test naukri_jobs"):
+        if st.button("Test new_jobs_data"):
             try:
-                res = supabase.table("naukri_jobs").select("*").limit(2).execute()
+                res = supabase.table("new_jobs_data").select("*").limit(2).execute()
                 st.success(f"✅ {len(res.data)} rows")
                 if res.data: st.dataframe(res.data)
             except Exception as e:
                 st.error(f"❌ {e}")
     with col2:
-        if st.button("Test jobs table"):
-            try:
-                res = supabase.table("jobs").select("*").limit(2).execute()
-                st.success(f"✅ {len(res.data)} rows")
-                if res.data: st.dataframe(res.data)
-            except Exception as e:
-                st.error(f"❌ {e}")
-    with col3:
         if st.button("Test job_embeddings"):
             try:
-                res = supabase.table("job_embeddings")\
-                    .select("id, jobtitle, company, location").limit(5).execute()
+                res = supabase.table("job_embeddings") \
+                    .select("jobId, title, companyName, location").limit(5).execute()
                 st.success(f"✅ {len(res.data)} embeddings")
                 if res.data: st.dataframe(res.data)
             except Exception as e:
                 st.error(f"❌ {e}")
-    with col4:
+    with col3:
         if st.button("Test RAG Search"):
             if vector_store:
                 docs = rag_search("python developer bangalore", vector_store)
@@ -894,20 +806,19 @@ with st.expander("🔧 Debug Panel"):
                     st.divider()
             else:
                 st.error("❌ RAG not ready")
-    with col5:
-        if st.button("🔄 Refresh RAG"):
-            try:
-                supabase.table("job_embeddings").delete().neq("id", -1).execute()
-                get_vector_store.clear()
-                st.success("✅ Cleared! Refresh page to rebuild.")
-            except Exception as e:
-                st.error(f"❌ {e}")
+
+    if st.button("🔄 Clear RAG index"):
+        try:
+            supabase.table("job_embeddings").delete().neq("jobId", -1).execute()
+            get_vector_store.clear()
+            st.success("✅ Cleared! Run `python build_job_embeddings.py` again to rebuild, then reload this app.")
+        except Exception as e:
+            st.error(f"❌ {e}")
 
 # ================================================
 # CHAT UI
 # ================================================
 if "messages" not in st.session_state:
-    # Load previous chat history from Supabase for this user
     saved_messages = load_chat_history(st.session_state["user_id"])
     greeting = {
         "role": "assistant",
@@ -916,7 +827,7 @@ if "messages" not in st.session_state:
             "I can help you with:\n"
             "- 🔍 **Semantic search** — *Find jobs matching my Python and ML skills*\n"
             "- 💬 **Follow-ups** — *What about Mumbai? Tell me more about that*\n"
-            "- 📊 **Queries** — *How many BPO jobs in Delhi?*\n"
+            "- 📊 **Queries** — *How many jobs in Delhi?*\n"
             "- 🎯 **Risk score** — *Calculate my AI risk score*\n"
             "- 💰 **Salary** — *Show salaries for data analysts*\n"
             "- 🏢 **Companies** — *Jobs at TCS or Infosys*\n"
@@ -963,7 +874,6 @@ if prompt := st.chat_input("Ask about jobs, skills, salaries, risk score..."):
                 is_hindi
             )
 
-        # Show rewritten query inline if different
         if rewritten != processing_prompt:
             st.caption(f"🔄 Searched for: _{rewritten}_")
 
