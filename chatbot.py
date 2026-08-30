@@ -97,6 +97,11 @@ Columns: jobId, title, companyName, companyId, location, experience,
          jobUploaded (relative text, NOT sortable — use days_ago),
          days_ago (generated integer, 0 = most recent posting),
          ReviewsCount, AggregateRating
+
+Note: pass the city name as the user said it (e.g. "Bangalore" or
+"Bengaluru") — the tool functions already check known old/current
+name variants (Bangalore/Bengaluru, Bombay/Mumbai, Madras/Chennai,
+Calcutta/Kolkata, Gurgaon/Gurugram, etc.) automatically.
 """
 
 # ------------------------------------------------
@@ -122,6 +127,45 @@ def format_salary(min_raw, max_raw, currency=None) -> str:
         return "Not disclosed"
     cur = currency or "₹"
     return f"{cur}{to_lakhs(min_val)}–{to_lakhs(max_val)} LPA"
+
+# ------------------------------------------------
+# CITY ALIASES
+# ------------------------------------------------
+# Several Indian cities have an old anglicized name and a current
+# official one, and job listings mix both inconsistently. A plain
+# ilike("location", "%bangalore%") finds zero rows if the data only
+# says "Bengaluru" — they don't share that substring at all, even
+# though they're the same city. RAG search doesn't have this problem
+# (it matches on meaning, not literal substrings), which is why RAG
+# found jobs a tool-calling query for the same city missed entirely.
+CITY_ALIASES = {
+    "bangalore": ["bangalore", "bengaluru"],
+    "bengaluru": ["bangalore", "bengaluru"],
+    "bombay": ["bombay", "mumbai"],
+    "mumbai": ["bombay", "mumbai"],
+    "madras": ["madras", "chennai"],
+    "chennai": ["madras", "chennai"],
+    "calcutta": ["calcutta", "kolkata"],
+    "kolkata": ["calcutta", "kolkata"],
+    "gurgaon": ["gurgaon", "gurugram"],
+    "gurugram": ["gurgaon", "gurugram"],
+    "cochin": ["cochin", "kochi"],
+    "kochi": ["cochin", "kochi"],
+    "trivandrum": ["trivandrum", "thiruvananthapuram"],
+    "thiruvananthapuram": ["trivandrum", "thiruvananthapuram"],
+    "pondicherry": ["pondicherry", "puducherry"],
+    "puducherry": ["pondicherry", "puducherry"],
+}
+
+def apply_city_filter(query, city: str):
+    """Filters by location, checking all known name variants of the
+    given city so an old/new naming mismatch doesn't silently return
+    zero results for a city that genuinely has listings."""
+    if not city:
+        return query
+    variants = CITY_ALIASES.get(city.strip().lower(), [city])
+    or_expr = ",".join(f"location.ilike.%{v}%" for v in variants)
+    return query.or_(or_expr)
 
 # ------------------------------------------------
 # TRANSLATION
@@ -546,7 +590,7 @@ def count_jobs(role="", city="", months=None):
     try:
         q = supabase.table("new_jobs_data").select("*", count="exact")
         if role: q = q.ilike("title", f"%{role}%")
-        if city: q = q.ilike("location", f"%{city}%")
+        if city: q = apply_city_filter(q, city)
         if months: q = q.lte("days_ago", 30 * int(months))
         return {"count": q.execute().count or 0}
     except Exception as e:
@@ -559,7 +603,7 @@ def list_jobs(role="", city="", months=None, limit=8):
             "minimumSalary, maximumSalary, currency"
         )
         if role: q = q.ilike("title", f"%{role}%")
-        if city: q = q.ilike("location", f"%{city}%")
+        if city: q = apply_city_filter(q, city)
         if months: q = q.lte("days_ago", 30 * int(months))
         rows = q.order("days_ago", desc=False).limit(int(limit)).execute().data or []
         for r in rows:
@@ -588,7 +632,7 @@ def salary_insights(role="", city=""):
             "title, companyName, location, minimumSalary, maximumSalary, currency"
         )
         if role: q = q.ilike("title", f"%{role}%")
-        if city: q = q.ilike("location", f"%{city}%")
+        if city: q = apply_city_filter(q, city)
         res = q.limit(30).execute()
         rows = []
         for r in res.data or []:
