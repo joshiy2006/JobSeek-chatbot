@@ -157,13 +157,15 @@ def embeddings_exist():
     except Exception:
         return False
 
-@st.cache_resource
 def get_vector_store():
     """
     Only CHECKS whether embeddings are ready — does not build them.
-    Given the size of new_jobs_data (97k+ rows), embedding runs via the
-    separate build_job_embeddings.py script (offline, or on a schedule),
-    not inline in the app's request path where it could time out.
+    Deliberately NOT cached: this used to wrap the actual (heavy)
+    embedding-building work, where caching made sense. Now it's just
+    two cheap count() queries, and caching it with @st.cache_resource
+    meant the result from whenever the server process first started
+    (e.g. before any embeddings existed) would stick around until the
+    whole process restarted — a browser reload alone wouldn't clear it.
     """
     try:
         total_res = supabase.table("new_jobs_data").select("jobId", count="exact").execute()
@@ -173,15 +175,18 @@ def get_vector_store():
         total_saved = saved_res.count or 0
 
         if total_saved >= total_jobs and total_saved > 0:
-            return True, total_saved, "ready"
+            return True, total_saved, total_jobs, "ready"
         elif total_saved > 0:
-            # RAG works, just hasn't finished indexing everything yet
-            return True, total_saved, "partial"
+            # RAG works over this subset — could be partial because the
+            # build script hasn't finished, or a deliberate cap (e.g.
+            # free-tier storage limits), so this isn't necessarily
+            # something to "fix".
+            return True, total_saved, total_jobs, "partial"
         else:
-            return None, 0, "not_built"
+            return None, 0, total_jobs, "not_built"
 
     except Exception as e:
-        return None, str(e), "exception"
+        return None, str(e), 0, "exception"
 
 def rag_search(query, vector_store=None, k=5):
     try:
@@ -761,13 +766,13 @@ Instructions:
 # BUILD RAG INDEX ON STARTUP
 # ================================================
 with st.spinner("⏳ Checking RAG index..."):
-    vector_store, result, status = get_vector_store()
+    vector_store, result, total_jobs, status = get_vector_store()
 
 if status == "ready":
     st.success(f"✅ RAG ready — {result} jobs indexed.")
 elif status == "partial":
-    st.warning(f"⚠️ RAG partially ready — {result} jobs indexed so far. "
-               f"Run `python build_job_embeddings.py` again to finish indexing the rest.")
+    st.info(f"ℹ️ RAG active on {result:,} of {total_jobs:,} listings (a subset, not the full "
+            f"table — e.g. due to storage limits). Semantic search still works, just over that subset.")
 elif status == "not_built":
     st.error("❌ No embeddings found yet. Run `python build_job_embeddings.py` "
              "separately, then reload this app.")
