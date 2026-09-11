@@ -1,0 +1,6 @@
+[server]
+enableCORS = true
+corsAllowedOrigins = [
+    "https://jobseek-xi.vercel.app",
+    "http://localhost:5173"
+]
