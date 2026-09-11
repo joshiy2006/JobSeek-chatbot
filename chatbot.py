@@ -39,13 +39,25 @@ llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="openai/gpt-oss-120b")
 # Auth: get token from URL params and verify user
 # ------------------------------------------------
 query_params = st.query_params
-auth_token = query_params.get("token")
+ticket_id = query_params.get("ticket")
 
-if not auth_token:
-    st.warning("⌛ No auth token received. Please close and reopen the chatbot panel.")
-    st.info("If this keeps happening, your session may have expired. Try logging out and back in.")
+if not ticket_id:
+    st.warning("⌛ No auth ticket received. Please close and reopen the chatbot panel.")
     st.stop()
 
+# Fetch the real token from the database
+ticket_response = supabase.table("auth_tickets").select("access_token").eq("id", ticket_id).execute()
+
+if not ticket_response.data:
+    st.error("❌ Invalid or expired session ticket. Please log out and back in.")
+    st.stop()
+
+auth_token = ticket_response.data[0]["access_token"]
+
+# Burn the ticket immediately so it cannot be reused
+supabase.table("auth_tickets").delete().eq("id", ticket_id).execute()
+
+# Verify the token
 try:
     user_response = supabase.auth.get_user(auth_token)
     current_user_id = user_response.user.id
@@ -54,6 +66,10 @@ except Exception:
     st.stop()
 
 st.session_state["user_id"] = current_user_id
+
+# Remove the ticket from the URL so it isn't copied/refreshed by accident
+if "ticket" in st.query_params:
+    del st.query_params["ticket"]
 
 # ------------------------------------------------
 # Chat History Persistence
