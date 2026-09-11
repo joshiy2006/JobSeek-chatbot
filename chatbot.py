@@ -48,38 +48,56 @@ llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="openai/gpt-oss-120b")
 # ------------------------------------------------
 # Auth: get token from URL params and verify user
 # ------------------------------------------------
-query_params = st.query_params
-ticket_id = query_params.get("ticket")
+# If the user is already authenticated in this Streamlit session,
+# don't require the ticket again on every rerun.
+if "user_id" in st.session_state:
+    current_user_id = st.session_state["user_id"]
 
-if not ticket_id:
-    st.warning("⌛ No auth ticket received. Please close and reopen the chatbot panel.")
-    st.stop()
+else:
+    # First load: get ticket from URL
+    ticket_id = st.query_params.get("ticket")
 
-# Fetch the real token from the database
-ticket_response = supabase.table("auth_tickets").select("access_token").eq("id", ticket_id).execute()
+    if not ticket_id:
+        st.warning(
+            "⌛ No auth ticket received. Please close and reopen the chatbot panel."
+        )
+        st.stop()
 
-if not ticket_response.data:
-    st.error("❌ Invalid or expired session ticket. Please log out and back in.")
-    st.stop()
+    # Fetch the real token from the database
+    ticket_response = (
+        supabase
+        .table("auth_tickets")
+        .select("access_token")
+        .eq("id", ticket_id)
+        .execute()
+    )
 
-auth_token = ticket_response.data[0]["access_token"]
+    if not ticket_response.data:
+        st.error(
+            "❌ Invalid or expired session ticket. Please log out and back in."
+        )
+        st.stop()
 
-# Burn the ticket immediately so it cannot be reused
-supabase.table("auth_tickets").delete().eq("id", ticket_id).execute()
+    auth_token = ticket_response.data[0]["access_token"]
 
-# Verify the token
-try:
-    user_response = supabase.auth.get_user(auth_token)
-    current_user_id = user_response.user.id
-except Exception:
-    st.error("❌ Invalid or expired session. Please log in again.")
-    st.stop()
+    # Burn the ticket immediately so it cannot be reused
+    supabase.table("auth_tickets").delete().eq("id", ticket_id).execute()
 
-st.session_state["user_id"] = current_user_id
+    # Verify the token
+    try:
+        user_response = supabase.auth.get_user(auth_token)
+        current_user_id = user_response.user.id
 
-# Remove the ticket from the URL so it isn't copied/refreshed by accident
-if "ticket" in st.query_params:
-    del st.query_params["ticket"]
+    except Exception:
+        st.error("❌ Invalid or expired session. Please log in again.")
+        st.stop()
+
+    # Store authenticated user in Streamlit session
+    st.session_state["user_id"] = current_user_id
+
+    # Remove ticket from URL after successful authentication
+    if "ticket" in st.query_params:
+        del st.query_params["ticket"]
 
 # ------------------------------------------------
 # Chat History Persistence
