@@ -32,6 +32,16 @@ if not GROQ_API_KEY or not SUPABASE_KEY or not SUPABASE_URL:
 # ------------------------------------------------
 # Supabase + LLM clients (must be created BEFORE auth check)
 # ------------------------------------------------
+# Add this temporarily to check if the keys are loading
+if not SUPABASE_KEY:
+    st.error("DEBUG: SUPABASE_KEY is empty! Environment variables are not loading.")
+    st.stop()
+elif len(SUPABASE_KEY) < 20:
+    st.error(f"DEBUG: SUPABASE_KEY is too short, it might be corrupted: {SUPABASE_KEY}")
+    st.stop()
+
+# Then your client initialization
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="openai/gpt-oss-120b")
 
