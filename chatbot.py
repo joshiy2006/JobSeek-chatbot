@@ -42,7 +42,6 @@ elif len(SUPABASE_KEY) < 20:
 
 # Then your client initialization
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="openai/gpt-oss-120b")
 
 # ------------------------------------------------
